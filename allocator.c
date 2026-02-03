@@ -1,4 +1,17 @@
 #include "allocator.h"
+#include <pthread.h>
+#include <sched.h>
+
+static _Thread_local ThreadCache *tc = NULL;
+static pthread_once_t init_once = PTHREAD_ONCE_INIT;
+Slab global_slab;
+Arena global_arena;
+
+static void global_init(void) {
+  arena_init(&global_arena);
+  slab_init(&global_slab, &global_arena);
+  pthread_mutex_init(&global_slab.mutex, NULL);
+}
 
 size_t get_page_aligned_size(size_t size) {
   size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
@@ -145,4 +158,92 @@ void slab_free(Slab *slab, void *ptr, size_t size) {
 
   node->next = slab->slab_nodes[sc];
   slab->slab_nodes[sc] = node;
+}
+
+void tc_init(void) {
+  pthread_once(&init_once, global_init);
+  if (tc == NULL) {
+    tc = (ThreadCache *)get_memory(sizeof(ThreadCache));
+    if (tc == NULL) {
+      return;
+    }
+    memset(tc, 0, sizeof(ThreadCache));
+    for (size_t i = 0; i < NUM_SLAB_CLASS; i++) {
+      tc->lines[i].batch_size = 32;
+      tc->lines[i].count = 0;
+    }
+  }
+}
+
+void *tc_alloc(size_t size) {
+  if (tc == NULL) {
+    tc_init();
+  }
+
+  size_t sc = size_to_class(size);
+  CacheLine *cl = &tc->lines[sc];
+
+  if (cl->count > 0) {
+    void *ptr = cl->list_head;
+    cl->list_head = ((SlabNode *)ptr)->next;
+    cl->count--;
+    return ptr;
+  }
+
+  pthread_mutex_lock(&global_slab.mutex);
+
+  if (!global_slab.slab_nodes[sc]) {
+    slab_refill(&global_slab, sc);
+  }
+
+  while (cl->count < cl->batch_size && global_slab.slab_nodes[sc]) {
+    SlabNode *node = global_slab.slab_nodes[sc];
+    global_slab.slab_nodes[sc] = node->next;
+    node->next = cl->list_head;
+    cl->list_head = node;
+    cl->count++;
+  }
+
+  pthread_mutex_unlock(&global_slab.mutex);
+
+  if (cl->count > 0) {
+    void *ptr = cl->list_head;
+    cl->list_head = ((SlabNode *)ptr)->next;
+    cl->count--;
+    return ptr;
+  }
+
+  return NULL;
+}
+
+void tc_free(void *ptr, size_t size) {
+  if (!ptr) {
+    return;
+  }
+  if (!tc) {
+    tc_init();
+  }
+
+  size_t sc = size_to_class(size);
+  CacheLine *cl = &tc->lines[sc];
+
+  if (cl->count >= cl->batch_size) {
+    pthread_mutex_lock(&global_slab.mutex);
+
+    for (size_t i = 0; i < 16; i++) {
+      SlabNode *node = cl->list_head;
+      cl->list_head = node->next;
+      cl->count--;
+
+      node->next = global_slab.slab_nodes[sc];
+      global_slab.slab_nodes[sc] = node;
+    }
+
+    pthread_mutex_unlock(&global_slab.mutex);
+  }
+
+  SlabNode *node = (SlabNode *)ptr;
+  node->next = cl->list_head;
+  cl->list_head = node;
+  cl->count++;
 }

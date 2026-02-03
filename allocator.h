@@ -2,7 +2,10 @@
 #define ALLOCATOR_H
 
 #include <assert.h>
+#include <bits/pthreadtypes.h>
+#include <pthread.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -10,6 +13,17 @@
 
 #define NUM_SLAB_CLASS 21
 #define SLAB_PREFETCH_COUNT 64
+
+typedef struct CacheLine {
+  void *list_head;
+  uint16_t count;
+  uint16_t batch_size;
+  char padding[52];
+} __attribute__((aligned(64))) CacheLine;
+
+typedef struct ThreadCache {
+  CacheLine lines[NUM_SLAB_CLASS];
+} ThreadCache;
 
 typedef struct Block {
   size_t size;
@@ -28,6 +42,7 @@ typedef struct SlabNode {
 typedef struct Slab {
   SlabNode *slab_nodes[NUM_SLAB_CLASS];
   Arena *arena;
+  pthread_mutex_t mutex;
 } Slab;
 
 void *get_memory(size_t size);
@@ -44,5 +59,9 @@ void slab_init(Slab *slab, Arena *arena);
 void slab_refill(Slab *slab, size_t sc);
 void *slab_alloc(Slab *slab, size_t size);
 void slab_free(Slab *slab, void *ptr, size_t size);
+
+void tc_init(void);
+void *tc_alloc(size_t size);
+void tc_free(void *ptr, size_t size);
 
 #endif /* ALLOCATOR_H */
